@@ -4,6 +4,7 @@
 """Pace rules match claude-swap's, so the panel and cswap agree on a number."""
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import random
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -45,13 +47,55 @@ PANEL_SERVICE = "agents-sidebar-accounts"
 LIVE_SERVICE = "Claude Code-credentials"
 
 
-def live_item():
+def live_item(env=None):
     """Claude Code's credential item: its service, and the account name it files it under.
 
     Claude Code uses $USER, falling back to the login name when that is unset.
     """
     import pwd
-    return LIVE_SERVICE, os.environ.get("USER") or pwd.getpwuid(os.geteuid()).pw_name
+    env = os.environ if env is None else env
+    config_dir = env.get("CLAUDE_SECURESTORAGE_CONFIG_DIR", env.get("CLAUDE_CONFIG_DIR", ""))
+    service = LIVE_SERVICE
+    if config_dir:
+        service += "-" + hashlib.sha256(unicodedata.normalize("NFC", config_dir).encode("utf-8")).hexdigest()[:8]
+    return service, env.get("USER") or pwd.getpwuid(os.geteuid()).pw_name
+
+
+def claude_credential_dir(env, home):
+    """Claude's credential locks follow its secure-storage directory too."""
+    config_dir = env.get("CLAUDE_SECURESTORAGE_CONFIG_DIR", env.get("CLAUDE_CONFIG_DIR", ""))
+    return unicodedata.normalize("NFC", config_dir or os.path.join(home, ".claude"))
+
+
+def code_sessions_claude_configs(home, primary_item, primary_config):
+    """Existing code-sessions metadata that shares the default Claude login.
+
+    The profile launcher uses the default Keychain service independently of
+    its transcript directory. Only initialized configs in that known profile
+    participate; no profile or credential item is created by discovery.
+    """
+    if primary_item[0] != LIVE_SERVICE:
+        return []
+    profile = os.path.join(home, ".local", "share", "code-sessions", "home")
+    _, config = claude_paths({"CLAUDE_CONFIG_DIR": os.path.join(profile, ".claude")}, home, os.path.exists)
+    paths = [config]
+    sessions = os.path.join(profile, "sessions")
+    try:
+        with os.scandir(sessions) as entries:
+            for entry in entries:
+                if entry.is_dir():
+                    session_dir = os.path.join(entry.path, ".cs", "claude-config")
+                    _, session_config = claude_paths({"CLAUDE_CONFIG_DIR": session_dir}, home, os.path.exists)
+                    paths.append(session_config)
+    except FileNotFoundError:
+        pass
+    seen, found = {os.path.realpath(primary_config)}, []
+    for path in paths:
+        resolved = os.path.realpath(path)
+        if resolved not in seen and os.path.isfile(path):
+            seen.add(resolved)
+            found.append(path)
+    return sorted(found)
 
 
 def pace(used, resets_at, fetched_at, window=WEEK_SECONDS):
@@ -1349,10 +1393,11 @@ class AccountMeters:
     a refused refresh marks the login dead in the store.
     """
 
-    def __init__(self, store_path, service, live_item, claude_json, claude_dir=None):
+    def __init__(self, store_path, service, live_item, claude_json, claude_dir=None, linked_configs=None):
         self.store_path, self.service = store_path, service
         self.live_item, self.claude_json = live_item, claude_json
         self.claude_dir = claude_dir or os.path.join(os.path.expanduser("~"), ".claude")
+        self.linked_configs = linked_configs
         self.states = {}
         #: Account id -> email, read from its login block once and kept for names.
         self.emails = {}
@@ -1498,7 +1543,9 @@ class AccountMeters:
         outgoing = account_for(stored, _live_login(self.claude_json))
         plan = plan_switch(stored, account_id, _live_login(self.claude_json), self.claude_dir,
                            self.claude_json, claude_dir_resolved=os.path.realpath(self.claude_dir))
-        run_switch(plan, self.store_path, self.service, self.live_item, self.claude_json, now)
+        linked = self.linked_configs() if self.linked_configs is not None else ()
+        run_switch(plan, self.store_path, self.service, self.live_item, self.claude_json, now,
+                   linked_claude_jsons=linked)
         # Read the new active account at once, through Claude Code's token this time.
         self.states.pop(account_id, None)
         self.last_switch = {"at": now, "from": outgoing["id"] if outgoing else None,
@@ -1548,6 +1595,9 @@ class AccountMeters:
         return result == "ok"
 
 
+_MISSING_LOGIN = object()
+
+
 def _replace_login(claude_json, login):
     """Put `login` in Claude Code's config as its oauthAccount, leaving every other key.
 
@@ -1557,7 +1607,10 @@ def _replace_login(claude_json, login):
     """
     with open(claude_json, encoding="utf-8") as f:
         config = json.load(f)
-    config["oauthAccount"] = login
+    if login is _MISSING_LOGIN:
+        config.pop("oauthAccount", None)
+    else:
+        config["oauthAccount"] = login
     temp = f"{claude_json}.{os.getpid()}.tmp"
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -1568,7 +1621,7 @@ def _replace_login(claude_json, login):
 
 
 def run_switch(plan, store_path, service, live_item, claude_json, now,
-               lock_timeout=LOCK_TIMEOUT_SECONDS):
+               lock_timeout=LOCK_TIMEOUT_SECONDS, linked_claude_jsons=()):
     """Carry out a switch plan. Raises SwitchRefused, with words for the user, when it stops.
 
     Before any write, a refusal leaves everything as it was. Once a write to
@@ -1579,6 +1632,15 @@ def run_switch(plan, store_path, service, live_item, claude_json, now,
     accounts = {a["id"]: a for a in load_store(store_path)}
     name = lambda account_id: _name(accounts[account_id])
     held, started, saved = [], [], {}
+    seen, linked = {os.path.realpath(claude_json)}, []
+    for path in linked_claude_jsons:
+        resolved = os.path.realpath(path)
+        if resolved not in seen:
+            seen.add(resolved)
+            # Replace the target, preserving a config-file symlink and
+            # sharing the target's native lock through writes and rollback.
+            linked.append(resolved)
+    linked.sort()
     try:
         for step in plan["steps"]:
             kind = step[0]
@@ -1604,6 +1666,18 @@ def run_switch(plan, store_path, service, live_item, claude_json, now,
             elif kind == "read_live":
                 saved["credential"] = read_secret(*live_item)
                 saved["login"] = _live_login(claude_json)
+                saved["logins"] = {claude_json: saved["login"]}
+                # Hold every linked config lock before changing any login.
+                # Snapshot only its account block: other settings stay local.
+                for path in linked:
+                    lock = DirLock(path + ".lock", stale=CONFIG_LOCK_STALE_SECONDS, timeout=lock_timeout)
+                    lock.__enter__()
+                    held.append(lock)
+                    with open(path, encoding="utf-8") as config_file:
+                        config = json.load(config_file)
+                    if not isinstance(config, dict):
+                        raise SwitchRefused("a code-sessions Claude config is not a JSON object")
+                    saved["logins"][path] = config.get("oauthAccount", _MISSING_LOGIN)
             elif kind == "verify_live_is":
                 if account_for(list(accounts.values()), saved["login"]) is not accounts[step[1]]:
                     raise SwitchRefused("the login changed since the switch was planned; try again")
@@ -1617,25 +1691,24 @@ def run_switch(plan, store_path, service, live_item, claude_json, now,
                     raise SwitchRefused(f"add {name(step[1])} again before switching to it")
                 saved["target_login"] = json.loads(login)
                 merged = merge_credential(json.loads(target), json.loads(saved["credential"]))
-                started.append(kind)
+                started.append((kind, None))
                 write_secret(*live_item, json.dumps(merged))
             elif kind == "write_oauth_account":
-                started.append(kind)
-                _replace_login(claude_json, saved["target_login"])
+                for path in [claude_json, *linked]:
+                    started.append((kind, path))
+                    _replace_login(path, saved["target_login"])
             else:
                 raise ValueError(f"unknown switch step {kind!r}")
     except Exception as error:
         unrestored = []
-        for kind in reversed(started):
+        for kind, path in reversed(started):
             try:
                 if kind == "write_live_credential":
                     write_secret(*live_item, saved["credential"])
                 else:
-                    _replace_login(claude_json, saved["login"])
+                    _replace_login(path, saved["logins"][path])
             except Exception:                                    # noqa: BLE001
                 unrestored.append(kind)
-        for lock in reversed(held):
-            lock.__exit__(None, None, None)
         reason = str(error) or type(error).__name__
         if unrestored:
             raise SwitchRefused(f"switch half done and could not be undone ({', '.join(unrestored)}): "
@@ -1645,6 +1718,9 @@ def run_switch(plan, store_path, service, live_item, claude_json, now,
         if isinstance(error, (SwitchRefused, LockTimeout)):
             raise SwitchRefused(reason) from error
         raise SwitchRefused(f"switch stopped before changing anything: {reason}") from error
+    finally:
+        for lock in reversed(held):
+            lock.__exit__(None, None, None)
 
 
 def main(argv=None):

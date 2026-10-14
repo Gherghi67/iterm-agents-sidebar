@@ -4349,8 +4349,12 @@ async def main(connection):
     token = secrets.token_urlsafe(24)
 
     claude_dir, claude_json = accounts.claude_paths(os.environ, str(Path.home()), os.path.exists)
+    live_item = accounts.live_item()
     meters = accounts.AccountMeters(accounts.STORE_PATH, accounts.PANEL_SERVICE,
-                                    accounts.live_item(), claude_json, claude_dir=claude_dir)
+                                    live_item, claude_json,
+                                    claude_dir=accounts.claude_credential_dir(os.environ, str(Path.home())),
+                                    linked_configs=lambda: accounts.code_sessions_claude_configs(
+                                        str(Path.home()), live_item, claude_json))
     sidebar = Sidebar(
         token=token,
         page_path=here / "page.html",
