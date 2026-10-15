@@ -75,6 +75,16 @@ works. Then it swaps Claude Code's credential and the account in
 `~/.claude.json` while holding Claude Code's own locks. If a step fails after a
 write, the panel puts the old login back and says so.
 
+The same switch controls Claude sessions launched through code-sessions. Its
+launcher shares Claude's default Keychain login while keeping transcripts and
+settings in its own profile. The panel also updates the account block in
+existing code-sessions profile and encrypted-session configs, under their
+config locks. A failure restores each config's own previous account and the
+shared credential. Each config keeps its other settings and project history.
+After installing this integration, reopen Claude sessions that were already
+running under code-sessions so they use the shared login. Codex subscriptions
+continue to use Codex's own authentication.
+
 Under the active account's bars, one line says where the last switch went, why,
 and how long ago. A chip marks a switch the panel made on its own.
 
