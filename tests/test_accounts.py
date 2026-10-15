@@ -3,6 +3,7 @@
 Expected values are worked by hand from the rules in docs/accounts-design.md.
 """
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -243,9 +244,45 @@ def test_claude_paths_follow_claude_config_dir():
     assert claude_paths({"CLAUDE_CONFIG_DIR": "/cfg"}, "/home/x", exists=lambda p: False) == ("/cfg", "/cfg/.claude.json")
 
 
-def test_claude_paths_prefer_a_legacy_config_json_when_one_exists():
-    assert claude_paths({}, "/home/x", exists=lambda p: p == "/home/x/.claude/.config.json") == (
-        "/home/x/.claude", "/home/x/.claude/.config.json")
+@pytest.mark.parametrize("custom_dir", [False, True])
+@pytest.mark.parametrize("legacy_kind, modern_exists, use_legacy", [
+    ("nonempty", False, True),
+    ("nonempty", True, True),
+    ("nonempty_readonly", True, True),
+    ("empty", False, True),
+    ("empty", True, False),
+    ("empty_readonly", False, False),
+    ("empty_readonly", True, False),
+    ("directory", False, False),
+    ("directory", True, False),
+    ("file_symlink", True, True),
+    ("empty_symlink", True, False),
+    ("directory_symlink", True, False),
+    ("dangling_symlink", True, False),
+])
+def test_claude_paths_match_native_legacy_file_selection(tmp_path, custom_dir, legacy_kind,
+                                                        modern_exists, use_legacy):
+    config_dir = tmp_path / ("custom" if custom_dir else ".claude")
+    config_dir.mkdir()
+    legacy = config_dir / ".config.json"
+    modern = (config_dir if custom_dir else tmp_path) / ".claude.json"
+    if legacy_kind == "directory":
+        legacy.mkdir()
+    elif legacy_kind.endswith("symlink"):
+        target = tmp_path / "legacy-target"
+        if legacy_kind == "directory_symlink":
+            target.mkdir()
+        elif legacy_kind != "dangling_symlink":
+            target.write_text("{}" if legacy_kind == "file_symlink" else "")
+        legacy.symlink_to(target)
+    else:
+        legacy.write_text("{}" if legacy_kind.startswith("nonempty") else "")
+        legacy.chmod(0o444 if legacy_kind.endswith("readonly") else 0o600)
+    if modern_exists:
+        modern.write_text('{"oauthAccount": {"accountUuid": "modern"}}')
+    env = {"CLAUDE_CONFIG_DIR": str(config_dir)} if custom_dir else {}
+    assert claude_paths(env, str(tmp_path), exists=os.path.exists) == (
+        str(config_dir), str(legacy if use_legacy else modern))
 
 
 def test_plan_switch_names_the_legacy_lock_after_the_resolved_config_directory():

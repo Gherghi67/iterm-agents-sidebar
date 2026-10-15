@@ -9,6 +9,7 @@ import json
 import os
 import random
 import ssl
+import stat
 import subprocess
 import sys
 import threading
@@ -805,15 +806,24 @@ def plan_switch(accounts, target_id, live_oauth_account, claude_dir, claude_json
 def claude_paths(env, home, exists):
     """Claude Code's config directory and global config file, resolved as it does.
 
-    CLAUDE_CONFIG_DIR replaces the home directory for both; a legacy
-    `.config.json` inside the config directory wins over `.claude.json`.
+    CLAUDE_CONFIG_DIR replaces the home directory for both. A legacy regular
+    file wins if nonempty, or if writable and the modern config is absent.
     """
     base = env.get("CLAUDE_CONFIG_DIR") or ""
     claude_dir = base or f"{home}/.claude"
     legacy = f"{claude_dir}/.config.json"
+    modern = f"{base or home}/.claude.json"
     if exists(legacy):
-        return claude_dir, legacy
-    return claude_dir, f"{base or home}/.claude.json"
+        try:
+            legacy_stat = os.stat(legacy)
+        except OSError:
+            pass
+        else:
+            if stat.S_ISREG(legacy_stat.st_mode) and (
+                    legacy_stat.st_size > 0
+                    or (legacy_stat.st_mode & 0o222 and not exists(modern))):
+                return claude_dir, legacy
+    return claude_dir, modern
 
 
 def _read_text(path):

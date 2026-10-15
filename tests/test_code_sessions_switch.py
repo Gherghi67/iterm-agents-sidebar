@@ -122,6 +122,38 @@ def test_switch_changes_shared_login_and_all_local_metadata_without_copying_cred
     no_locks(world)
 
 
+@pytest.mark.parametrize("legacy_kind", ["empty", "directory"])
+def test_discovery_and_switch_use_modern_metadata_beside_unused_legacy(world, legacy_kind):
+    profile = world["root"] / ".local/share/code-sessions/home"
+    configs = [profile / ".claude/.claude.json",
+               profile / "sessions/vaulted/.cs/claude-config/.claude.json"]
+    legacy_paths = []
+    for config in configs:
+        write_config(config, theme="local")
+        legacy = config.with_name(".config.json")
+        if legacy_kind == "empty":
+            legacy.write_text("")
+        else:
+            legacy.mkdir()
+        legacy_paths.append(legacy)
+
+    discovered = accounts.code_sessions_claude_configs(
+        str(world["root"]), world["live"], world["primary"])
+    assert set(discovered) == {str(config) for config in configs}
+    run(world, discovered)
+    for config in configs:
+        assert json.loads(config.read_text()) == {"oauthAccount": BOB, "theme": "local"}
+    for legacy in legacy_paths:
+        if legacy_kind == "empty":
+            assert legacy.read_text() == ""
+        else:
+            assert legacy.is_dir() and list(legacy.iterdir()) == []
+    assert json.loads(Path(world["primary"]).read_text())["oauthAccount"] == BOB
+    assert json.loads(world["secrets"][world["live"]])["claudeAiOauth"] == {
+        "refreshToken": "stored-b"}
+    no_locks(world)
+
+
 def test_linked_config_failure_restores_each_original_account_and_shared_credential(world, monkeypatch):
     original = {path: json.loads(Path(path).read_text())
                 for path in [world["primary"], world["profile"], world["encrypted"]]}
